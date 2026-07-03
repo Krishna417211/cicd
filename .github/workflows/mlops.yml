@@ -12,14 +12,10 @@ on:
 
 jobs:
   # ==========================================================
-  # JOB 1: BUILD, TRAIN, EVALUATE, DECIDE  (the "CI" part)
+  # JOB 1: BUILD, TRAIN, EVALUATE  (the "CI" part)
   # ==========================================================
   train-and-evaluate:
     runs-on: ubuntu-latest
-
-    # exposes the decision so the deploy job can read it
-    outputs:
-      decision: ${{ steps.decide.outputs.decision }}
 
     steps:
       - name: Checkout repository
@@ -48,17 +44,6 @@ jobs:
       # ---- train + MLflow ----
       - name: Train model (MLflow tracking)
         run: python src/train.py
-
-      # ---- automatic deploy-or-rollback decision ----
-      # promotes the new model ONLY if it beats the current Production model,
-      # otherwise keeps (rolls back to) the old one.
-      - name: Decide deploy or rollback
-        id: decide
-        run: |
-          python scripts/auto_deploy_or_rollback.py
-          DECISION=$(python -c "import json;print(json.load(open('best_model.json'))['decision'])")
-          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
-          echo "Pipeline decision: $DECISION"
 
       # ---- export SavedModel for TensorFlow Serving ----
       - name: Export model for TF Serving
@@ -113,13 +98,14 @@ jobs:
             mlflow.db
 
   # ==========================================================
-  # JOB 2: DEPLOY  (only runs if a NEW model was actually chosen)
+  # JOB 2: DEPLOY  (builds and publishes the serving image)
   # ==========================================================
   deploy:
     needs: train-and-evaluate
     runs-on: ubuntu-latest
-    # Skip deploy entirely if the decision was to roll back / keep the old model.
-    if: ${{ needs.train-and-evaluate.outputs.decision != 'rollback_keep_champion' }}
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout repository
@@ -147,17 +133,3 @@ jobs:
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           docker tag taxi-fare-api $IMAGE:latest
           docker push $IMAGE:latest
-
-  # ==========================================================
-  # JOB 3: report a rollback (runs only when we kept the old model)
-  # ==========================================================
-  rollback-notice:
-    needs: train-and-evaluate
-    runs-on: ubuntu-latest
-    if: ${{ needs.train-and-evaluate.outputs.decision == 'rollback_keep_champion' }}
-    steps:
-      - name: Report rollback
-        run: |
-          echo "New model was worse than Production."
-          echo "Automatic rollback: kept the existing Production model."
-          echo "No new image deployed."
