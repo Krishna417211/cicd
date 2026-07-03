@@ -1,0 +1,10 @@
+{
+    "model_name": "TaxiFareModel",
+    "version": 1,
+    "run_id": "acaf24dbcc954060b48fa8a08570ba45",
+    "mse": 1.2267482776836809,
+    "mae": 0.6690023045563818,
+    "r2_score": 0.9929202422795929,
+    "git_commit": "unknown",
+    "git_branch": "unknown"
+}

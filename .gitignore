@@ -1,0 +1,7 @@
+mlflow.db
+mlruns/
+__pycache__/
+*.pyc
+venv/
+data/taxi_clean.csv
+models/taxi_model.keras

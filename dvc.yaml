@@ -1,0 +1,16 @@
+stages:
+  preprocess:
+    cmd: python src/preprocess.py
+    deps:
+      - src/preprocess.py
+      - data/sample_10000_rows.csv
+    outs:
+      - data/taxi_clean.csv
+
+  train:
+    cmd: python src/train.py
+    deps:
+      - src/train.py
+      - data/taxi_clean.csv
+    outs:
+      - models/taxi_model.keras

@@ -1,0 +1,109 @@
+name: MLOps CI-CD Pipeline
+
+# Runs automatically on every push to main/master
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:      # also lets you run it manually from the Actions tab
+
+jobs:
+  # ==========================================================
+  # JOB 1: BUILD, TRAIN, EVALUATE  (the "CI" part)
+  # ==========================================================
+  train-and-evaluate:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---- Stage 0: get the code ----
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history so compare/rollback can read git
+
+      # ---- Set up Python ----
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ---- Install everything ----
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Stage 1: DVC pull (get versioned data) ----
+      # If you use a remote, this fetches the tracked data.
+      # Falls back gracefully if no remote is configured.
+      - name: DVC pull data
+        run: |
+          dvc pull || echo "No DVC remote configured, using data in repo"
+
+      # ---- Stage 2: Preprocess ----
+      - name: Preprocess data
+        run: python src/preprocess.py
+
+      # ---- Stage 3: Train + log to MLflow ----
+      # train.py logs params/metrics/model to sqlite MLflow and registers the model.
+      - name: Train model (MLflow tracking)
+        run: python src/train.py
+
+      # ---- Stage 4: Compare models, pick the best ----
+      - name: Compare models
+        run: python scripts/compare_model.py
+
+      # ---- Stage 5: Promote best model to Production ----
+      - name: Promote best model
+        run: python scripts/promote_model.py
+
+      # ---- Stage 6: Monitor (health + drift check) ----
+      - name: Monitor model
+        run: python scripts/monitor.py
+
+      # ---- Save the trained model + mlflow db as artifacts ----
+      # so the deploy job can pick them up.
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: |
+            models/taxi_model.keras
+            best_model.json
+            mlflow.db
+
+  # ==========================================================
+  # JOB 2: DEPLOY  (the "CD" part) - only if training passed
+  # ==========================================================
+  deploy:
+    needs: train-and-evaluate     # waits for job 1 to succeed
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Get the trained model from job 1 ----
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: .
+
+      # ---- Stage 7: Build the serving Docker image ----
+      - name: Build Docker image
+        run: docker build -t taxi-fare-api .
+
+      # ---- Stage 8: Publish image to GitHub Container Registry ----
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          docker tag taxi-fare-api $IMAGE:latest
+          docker push $IMAGE:latest
