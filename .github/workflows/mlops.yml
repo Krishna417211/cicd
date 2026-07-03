@@ -1,99 +1,139 @@
 name: MLOps CI-CD Pipeline
 
-# Runs automatically on every push to main/master
+# Runs automatically on: push, a weekly schedule (automated retraining), or manually
 on:
   push:
     branches: [ main, master ]
+  schedule:
+    # Automated retraining: runs every Monday at 03:00 UTC.
+    # cron format: minute hour day-of-month month day-of-week
+    - cron: "0 3 * * 1"
   workflow_dispatch:      # also lets you run it manually from the Actions tab
 
 jobs:
   # ==========================================================
-  # JOB 1: BUILD, TRAIN, EVALUATE  (the "CI" part)
+  # JOB 1: BUILD, TRAIN, EVALUATE, DECIDE  (the "CI" part)
   # ==========================================================
   train-and-evaluate:
     runs-on: ubuntu-latest
 
+    # exposes the decision so the deploy job can read it
+    outputs:
+      decision: ${{ steps.decide.outputs.decision }}
+
     steps:
-      # ---- Stage 0: get the code ----
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # full history so compare/rollback can read git
+          fetch-depth: 0
 
-      # ---- Set up Python ----
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ---- Install everything ----
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ---- Stage 1: DVC pull (get versioned data) ----
-      # If you use a remote, this fetches the tracked data.
-      # Falls back gracefully if no remote is configured.
       - name: DVC pull data
         run: |
           dvc pull || echo "No DVC remote configured, using data in repo"
 
-      # ---- Stage 2: Preprocess ----
+      # ---- preprocess ----
       - name: Preprocess data
         run: python src/preprocess.py
 
-      # ---- Stage 3: Train + log to MLflow ----
-      # train.py logs params/metrics/model to sqlite MLflow and registers the model.
+      # ---- train + MLflow ----
       - name: Train model (MLflow tracking)
         run: python src/train.py
 
-      # ---- Stage 4: Compare models, pick the best ----
-      - name: Compare models
-        run: python scripts/compare_model.py
+      # ---- automatic deploy-or-rollback decision ----
+      # promotes the new model ONLY if it beats the current Production model,
+      # otherwise keeps (rolls back to) the old one.
+      - name: Decide deploy or rollback
+        id: decide
+        run: |
+          python scripts/auto_deploy_or_rollback.py
+          DECISION=$(python -c "import json;print(json.load(open('best_model.json'))['decision'])")
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "Pipeline decision: $DECISION"
 
-      # ---- Stage 5: Promote best model to Production ----
-      - name: Promote best model
-        run: python scripts/promote_model.py
+      # ---- export SavedModel for TensorFlow Serving ----
+      - name: Export model for TF Serving
+        run: python scripts/export_savedmodel.py
 
-      # ---- Stage 6: Monitor (health + drift check) ----
+      # ---- start TensorFlow Serving and test it ----
+      # Runs the official tensorflow/serving container, mounts the exported
+      # model, waits for it to boot, then sends a real prediction request.
+      - name: Deploy & test with TensorFlow Serving
+        run: |
+          echo "Starting TensorFlow Serving container..."
+          docker run -d --name tf-serving \
+            -p 8501:8501 \
+            -v "${{ github.workspace }}/models/taxi_model:/models/taxi_model" \
+            -e MODEL_NAME=taxi_model \
+            tensorflow/serving:latest
+
+          echo "Waiting for TF Serving to be ready..."
+          for i in $(seq 1 20); do
+            if curl -s http://localhost:8501/v1/models/taxi_model | grep -q "AVAILABLE"; then
+              echo "TF Serving is up."
+              break
+            fi
+            sleep 3
+          done
+
+          echo "Model status:"
+          curl -s http://localhost:8501/v1/models/taxi_model
+
+          echo ""
+          echo "Sending a test prediction (4 features)..."
+          curl -s -X POST http://localhost:8501/v1/models/taxi_model:predict \
+            -H "Content-Type: application/json" \
+            -d '{"instances": [[1, 2.5, 10.0, 2.0]]}'
+
+          echo ""
+          echo "Stopping TF Serving container..."
+          docker stop tf-serving && docker rm tf-serving
+
+      # ---- monitor ----
       - name: Monitor model
         run: python scripts/monitor.py
 
-      # ---- Save the trained model + mlflow db as artifacts ----
-      # so the deploy job can pick them up.
       - name: Upload model artifacts
         uses: actions/upload-artifact@v4
         with:
           name: model-artifacts
           path: |
             models/taxi_model.keras
+            models/taxi_model/
             best_model.json
             mlflow.db
 
   # ==========================================================
-  # JOB 2: DEPLOY  (the "CD" part) - only if training passed
+  # JOB 2: DEPLOY  (only runs if a NEW model was actually chosen)
   # ==========================================================
   deploy:
-    needs: train-and-evaluate     # waits for job 1 to succeed
+    needs: train-and-evaluate
     runs-on: ubuntu-latest
+    # Skip deploy entirely if the decision was to roll back / keep the old model.
+    if: ${{ needs.train-and-evaluate.outputs.decision != 'rollback_keep_champion' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---- Get the trained model from job 1 ----
       - name: Download model artifacts
         uses: actions/download-artifact@v4
         with:
           name: model-artifacts
           path: .
 
-      # ---- Stage 7: Build the serving Docker image ----
       - name: Build Docker image
         run: docker build -t taxi-fare-api .
 
-      # ---- Stage 8: Publish image to GitHub Container Registry ----
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -107,3 +147,17 @@ jobs:
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           docker tag taxi-fare-api $IMAGE:latest
           docker push $IMAGE:latest
+
+  # ==========================================================
+  # JOB 3: report a rollback (runs only when we kept the old model)
+  # ==========================================================
+  rollback-notice:
+    needs: train-and-evaluate
+    runs-on: ubuntu-latest
+    if: ${{ needs.train-and-evaluate.outputs.decision == 'rollback_keep_champion' }}
+    steps:
+      - name: Report rollback
+        run: |
+          echo "New model was worse than Production."
+          echo "Automatic rollback: kept the existing Production model."
+          echo "No new image deployed."

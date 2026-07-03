@@ -62,6 +62,40 @@ if os.path.exists(DATA_PATH):
 else:
     print("\nNo cleaned data found - skipping drift check.")
 
+# ----------------------------------------
+# 3. Monitoring services health check
+#    Checks whether Prometheus and Grafana URLs are reachable.
+#    These only run when the docker-compose monitoring stack is up,
+#    so we report status without failing the pipeline if they are down.
+# ----------------------------------------
+try:
+    import requests
+except ImportError:
+    requests = None
+
+print("\n" + "-" * 60)
+print("Monitoring services")
+print("-" * 60)
+
+services = {
+    "Prometheus": "http://localhost:9090/-/healthy",
+    "Grafana": "http://localhost:3000/api/health",
+}
+
+if requests is None:
+    print("requests not installed - skipping URL checks")
+else:
+    for name, url in services.items():
+        try:
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                print(f"[OK]   {name:<12} reachable at {url}")
+            else:
+                print(f"[WARN] {name:<12} returned status {r.status_code}")
+        except Exception:
+            print(f"[DOWN] {name:<12} not reachable "
+                  f"(is the docker-compose stack running?)")
+
 print("\n" + "=" * 60)
 print("Monitoring completed")
 print("=" * 60)
