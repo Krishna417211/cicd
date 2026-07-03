@@ -1,8 +1,7 @@
 import pandas as pd
 
 
-df  = pd.read_csv('data\sample_10000_rows.csv',nrows = 1000,usecols =
-[
+df = pd.read_csv('data/sample_10000_rows.csv', nrows=1000, usecols=[
     'passenger_count',
     'trip_distance',
     'fare_amount',
